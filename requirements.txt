@@ -20,6 +20,8 @@ uvicorn>=0.29.0
 # ---- 「漫研」并入模块(2026): 评论情感分析(TextCNN 本地推理) ----
 # jieba: 分词(情感分析预处理必需; 缺失时自动降级为字符切分)
 jieba>=0.42.0
-# torch: TextCNN 推理(CPU 版即可)。安装: pip install torch --index-url https://download.pytorch.org/whl/cpu
-# 缺失时情感分析工具自动降级(其余功能不受影响, 见 sentiment/service.py)
-torch>=2.0.0
+# torch: TextCNN 推理(CPU 版即可, 可选依赖)。⚠️ 不列入本清单与锁文件:
+#   torch 只发布在 PyTorch 官方索引(download.pytorch.org), PyPI 上没有, 若进入
+#   requirements-lock.txt 会导致 CI 的 pip install -r 锁文件安装直接失败;
+#   需要启用本地情感分析时单独安装(缺失时情感分析工具自动降级, 其余功能不受影响):
+#       pip install torch --index-url https://download.pytorch.org/whl/cpu

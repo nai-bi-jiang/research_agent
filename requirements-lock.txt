@@ -127,8 +127,11 @@ tenacity==9.1.4
 tiktoken==0.14.0
 tokenizers==0.23.1
 toml==0.10.2
-# 「漫研」(2026): 评论情感分析 TextCNN 推理(顶层依赖, CPU 版; 缺失时情感分析降级)
-torch==2.14.0+cpu
+# 「漫研」(2026): 评论情感分析 TextCNN 推理依赖 torch 不锁定——
+#   torch 仅发布在 PyTorch 官方索引(download.pytorch.org), PyPI 无此包, 锁定会导致
+#   CI 的 pip install -r requirements-lock.txt 失败; 启用本地情感分析时单独安装:
+#       pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   (缺失时情感分析工具自动降级, 其余功能不受影响, 见 sentiment/service.py)
 tqdm==4.70.0
 truststore==0.10.4
 typer==0.27.2

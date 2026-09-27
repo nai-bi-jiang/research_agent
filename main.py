@@ -48,7 +48,6 @@ from core.comment_ingest import (  # 「漫研」评论数据合规接入(去标
 )
 from core.tasks import (  # 「漫研」内容行业任务类型注册表(2026 新增)
     TASK_GENERAL as _TASK_GENERAL,
-    TASK_LABELS as _TASK_LABELS,
     normalize_task_type as _normalize_task_type,
 )
 from core.config import env_flag as _env_flag, env_int as _env_int  # 统一配置解析

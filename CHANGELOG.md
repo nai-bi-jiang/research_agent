@@ -2,6 +2,25 @@
 
 本项目变更记录。版本号规则: 语义化版本(主.次.修订)。
 
+## [1.7.0-fix5] - 2026-09-27 — CI 修复: torch 移出锁文件 + ruff lint 清理
+
+**问题**: v1.7.0 推送后 GitHub Actions CI 两个 job 失败——
+① 锁文件含 `torch==2.14.0+cpu`(仅存在于 PyTorch 官方索引, PyPI 无此包),
+导致测试 job 的 `pip install -r requirements-lock.txt` 直接失败;
+② ruff lint job 报 4 个 F401/F541 错误。
+
+**修复**
+- `requirements.txt` / `requirements-lock.txt`: torch 不再列入依赖清单与锁文件,
+  注释说明单独安装方式(`pip install torch --index-url https://download.pytorch.org/whl/cpu`);
+  缺失时情感分析工具自动降级, 其余功能不受影响(见 `sentiment/service.py`);
+- ruff 清理 4 处: `main.py` 未用导入 TASK_LABELS / `server.py` 未用导入
+  verify_report_citations / `tests/test_sentiment_service.py` 未用 `import pytest` /
+  `sentiment/service.py` 无占位符 f-string;
+- `pyproject.toml`: 版本 1.6.0 → 1.7.0, description 同步「漫研」定位。
+
+**验证**: 锁一致性校验通过(136 包); `pip install --dry-run -r requirements-lock.txt`
+在纯 PyPI 索引下解析成功; 本地全量 **215 passed / 0 failed / 1 skipped**。
+
 ## [1.7.0-fix4] - 2026-09-27 — 引用护栏(防编造链接) + few-shot 工作示例 + 同类项目调研
 
 **改进②(引用护栏, 防编造链接)**

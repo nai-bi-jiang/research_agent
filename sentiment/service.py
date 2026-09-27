@@ -178,7 +178,7 @@ class SentimentService:
         counts = Counter(r["label_name"] for r in results)
         total = len(results)
         lines = [
-            f"情感分析模型: TextCNN(电商评论预训练权重, 3 分类: 负向/中性/正向)",
+            "情感分析模型: TextCNN(电商评论预训练权重, 3 分类: 负向/中性/正向)",
             f"共分析 {total} 条评论: 正向 {counts['正向']} 条({counts['正向']/total:.1%}), "
             f"中性 {counts['中性']} 条({counts['中性']/total:.1%}), "
             f"负向 {counts['负向']} 条({counts['负向']/total:.1%})",

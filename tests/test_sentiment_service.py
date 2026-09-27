@@ -7,7 +7,6 @@ tests/test_sentiment_service.py —— 情感分析服务(并入模块)基础行
     - classify_batch 模型不可用时返回空列表(调用方按降级处理);
     - 模型可用时的批量分类与聚合摘要(若 torch 已安装且权重就位)。
 """
-import pytest
 
 from sentiment.service import SentimentService
 

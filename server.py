@@ -34,7 +34,6 @@ from core.config import env_flag
 from core.comment_ingest import load_comments, _build_material  # 「漫研」评论合规接入(2026 新增)
 from core.file_store import delete_uploaded_files, save_upload
 from core.ingest import ingest_upload
-from core.report_verifier import verify_report_citations
 from core.tasks import normalize_task_type  # 「漫研」任务类型规范化(2026 新增)
 from graph_builder import build_graph, build_llm, rerun_report_with_guard
 from logging_setup import get_logger
