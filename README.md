@@ -1,4 +1,4 @@
-![CI](https://github.com/nbjrhmt/research_agent/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/nai-bi-jiang/research_agent/actions/workflows/ci.yml/badge.svg)
 
 # 📡 漫研 · 内容调研与口碑情报 Agent(LangGraph + Streamlit)
 
