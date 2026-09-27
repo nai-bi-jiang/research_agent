@@ -22,6 +22,7 @@ ddgs(DuckDuckGo)+ 必应 RSS/HTML 抓取方案——抓取方案经常被反爬�
     【工具异常】开头的说明文字(由上层作为一条素材记录, 不中断调研主流程)。
 """
 import os
+import re
 import time
 
 from core.config import env_int, env_str  # 统一环境变量解析(2026 重构 P1)
@@ -44,18 +45,47 @@ _FRESHNESS_OPTIONS = ("oneday", "oneweek", "onemonth", "oneyear", "nolimit")
 # 本文件旧版本各自实现的同名本地解析函数已删除, 与 graph_builder.py 共用同一出处。
 
 
+# ============================ 通用: URL 清洗 ============================
+# 注意: 字符集内 `]` 必须放首位或用 `\]`, 否则提前结束字符集(中文标点不会进匹配集)。
+_PERCENT_TAIL_RE = re.compile(r"(?:%[0-9A-Fa-f]{1,3})+$")        # 尾随百分号编码(1-3 位 hex, 兼容全角转半角后)
+_TRAILING_PUNCT_RE = re.compile(r"[)\]},.;:!?…、，。；：！？」』】]*$")  # 尾随标点/括号(含全角逗号)
+_FULLWIDTH_TRANS = str.maketrans(  # 全角百分号/十六进制字符 -> 半角(网页转义偶发全角)
+    "％０１２３４５６７８９ＡＢＣＤＥＦａｂｃｄｅｆ",
+    "%0123456789ABCDEFabcdef",
+)
+
+
+def clean_url(url: str) -> str:
+    """清洗素材链接: 去掉搜索摘要里拼接的乱码尾巴与标点, 只保留真实 http(s) 链接。
+
+    背景(真实调研观察): 博查 snippet 里的链接常带百分号编码尾巴
+    (如 "https://a.test/op)%EF%BC%9B%E3%80%94%E7%B4%A0%E6%9D%90" —— 那是中文标点被
+    编码后拼进 URL), 原样进报告会显得脏。清洗规则:
+      1) 全角百分号/hex 转半角(偶发形态);
+      2) 去掉尾部连续百分号编码(%XX...);
+      3) 再去掉尾部标点/括号;
+      4) 仅 http/https 开头才算有效链接, 否则返回空串(由调用方显示"(无链接)")。
+    """
+    s = str(url or "").strip().translate(_FULLWIDTH_TRANS)
+    s = _PERCENT_TAIL_RE.sub("", s)
+    s = _TRAILING_PUNCT_RE.sub("", s).strip()
+    return s if s.lower().startswith(("http://", "https://")) else ""
+
+
 # ============================ 通用: 格式化结果 ============================
 def _format_results(items: list) -> str:
-    """把博查返回的 [{title,href,body}...] 结构化为统一素材文本(编号 + 标题/链接/摘要)。"""
+    """把博查返回的 [{title,href,body,...}] 结构化为统一素材文本(编号 + 标题/链接/摘要/发布时间)。"""
     lines = [f"共获取 {len(items)} 条结果:"]
     for i, item in enumerate(items, start=1):
         title = str(item.get("title") or "(无标题)")
-        href = str(item.get("href") or item.get("url") or "(无链接)")
+        href = clean_url(str(item.get("href") or item.get("url") or "")) or "(无链接)"
         body = str(item.get("body") or "").strip() or "(无摘要)"
         if len(body) > 800:
             body = body[:800] + "…"
         lines.append(f"[{i}] 标题: {title}")
         lines.append(f"    链接: {href}")
+        if item.get("published"):
+            lines.append(f"    发布时间: {item['published']}")
         lines.append(f"    摘要: {body}")
     return "\n".join(lines)
 
@@ -152,8 +182,15 @@ def bocha_web_search(query: str, max_results: int | None = None,
         url = str(item.get("url") or item.get("displayUrl") or "").strip()
         # 摘要模式取 summary(无 summary 时回退到 snippet / 正文片段)
         body_text = str(item.get("summary") or item.get("snippet") or item.get("body") or "").strip()
+        # 发布时间(网页发布时间, 供报告标注数据时间口径; 无则留空)
+        published = str(item.get("datePublished") or item.get("dateLastCrawled") or "").strip()
         if title or url:
-            items.append({"title": title, "href": url, "body": body_text})
+            items.append({
+                "title": title,
+                "href": url,
+                "body": body_text,
+                "published": published,
+            })
         if len(items) >= count:
             break
 

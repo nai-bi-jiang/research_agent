@@ -17,3 +17,9 @@ tiktoken>=0.7.0
 # API 服务化(server.py): FastAPI 把 LangGraph Agent 封装为 REST 服务
 fastapi>=0.110.0
 uvicorn>=0.29.0
+# ---- 「漫研」并入模块(2026): 评论情感分析(TextCNN 本地推理) ----
+# jieba: 分词(情感分析预处理必需; 缺失时自动降级为字符切分)
+jieba>=0.42.0
+# torch: TextCNN 推理(CPU 版即可)。安装: pip install torch --index-url https://download.pytorch.org/whl/cpu
+# 缺失时情感分析工具自动降级(其余功能不受影响, 见 sentiment/service.py)
+torch>=2.0.0

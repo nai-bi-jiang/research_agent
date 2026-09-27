@@ -42,6 +42,15 @@ from core.history_store import (  # 历史 JSON 持久化 / 记录构造 / 文�
     save_report_history_to_disk as _save_report_history_to_disk,
 )
 from core.ingest import ingest_upload as _ingest_upload  # 上传文件预读为素材
+from core.comment_ingest import (  # 「漫研」评论数据合规接入(去标识化, 2026 新增)
+    load_comments as _load_comments,
+    parse_comments_text as _parse_comments_text,
+)
+from core.tasks import (  # 「漫研」内容行业任务类型注册表(2026 新增)
+    TASK_GENERAL as _TASK_GENERAL,
+    TASK_LABELS as _TASK_LABELS,
+    normalize_task_type as _normalize_task_type,
+)
 from core.config import env_flag as _env_flag, env_int as _env_int  # 统一配置解析
 from core.report_verifier import (  # 报告引用一致性校验(v1.6.0 防幻觉闭环)
     citation_check_mark as _citation_check_mark,
@@ -65,7 +74,7 @@ HUMAN_IN_THE_LOOP = _env_flag("HUMAN_IN_THE_LOOP", False)  # 反思"继续搜集
 
 
 # 页面配置必须在任何 st 组件之前
-st.set_page_config(page_title="本地个人调研Agent", page_icon="🔎", layout="wide")
+st.set_page_config(page_title="漫研 · 内容调研与口碑情报 Agent", page_icon="📡", layout="wide")
 
 # ============================ 📜 历史报告存储: 会话内存 + JSON 本地持久化 ============================
 # 存储策略(与旧版完全一致, 实现已迁 core/history_store.py, 本文件只保留路径与内存态):
@@ -130,6 +139,7 @@ try:
 
     from graph_builder import (
         ALLOW_CODE_EXEC, DEFAULT_MODEL, MAX_ITERATIONS, build_graph, build_llm,
+        rerun_report_with_guard,
     )
     from langgraph.checkpoint.memory import InMemorySaver  # 异常兜底: 取回已搜集素材
     from langgraph.types import Command  # HITL: 人工确认后以 Command(resume=...) 恢复执行
@@ -268,7 +278,8 @@ def _salvage_run_materials(exc: Exception, graph, config, user_query: str,
 
 
 def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | None = None,
-                      hitl_decision: str | None = None):
+                      hitl_decision: str | None = None, task_type: str | None = None,
+                      comments: list | None = None):
     """
     运行 LangGraph 主流程并实时展示每一步:
     返回 (最终报告, 轮次, 素材总数, 生成图表路径列表, 最终素材列表)
@@ -280,14 +291,36 @@ def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | Non
     :param hitl_decision: 非 None = 人工确认(Human-in-the-loop)恢复 —— 以
         Command(resume=hitl_decision) 从中断点继续执行(确认按钮写入 session_state);
         默认 None = 正常新建/断点续研流程。
+    :param task_type: 「漫研」内容行业任务类型(规范化后写入 State, 驱动任务专用提示词);
+        None = 通用调研(向后兼容)。
+    :param comments: 已去标识化的评论文本列表(仅文本); 口碑监测等任务使用
+        (sentiment_analyzer 工具数据源, 见 core/comment_ingest 合规接入)。
     """
     # ---- 0. 初始化 State: 上传文件先自动预读为素材 ----
     # 注(断点续研): 恢复历史会话时跳过文件预读 —— uploaded_files 清单与已预读素材都在
     # 原会话 checkpoint 状态里, 恢复执行以 checkpoint 为准(本次新上传文件不参与恢复)。
     initial_materials = []
     logs = []
+    comments = list(comments or [])  # 调用方传入的评论(粘贴文本), 上传 CSV 的评论在此追加
     if resume_thread_id is None:
         for fname in fnames:
+            # ---- 「漫研」评论文件优先走合规接入(2026 新增) ----
+            # 上传的 CSV 若识别到评论文本列: 提取(去标识化)进 state.comments 供情感分析,
+            # 并生成"评论数据素材"; 未识别到评论列时退回原 CSV 结构预览(行为不变)。
+            ext = os.path.splitext(fname)[1].lower()
+            if ext == ".csv":
+                _comments, _stats = _load_comments(fname)
+                if _comments:
+                    comments.extend(_comments)
+                    # 生成带统计的评论数据素材(保留"共 N 条/已去标识化"信息, 便于报告溯源)
+                    from core.comment_ingest import _build_material
+
+                    material, _ = _build_material(
+                        _comments, f"上传评论文件 {os.path.basename(fname)}", _stats)
+                    initial_materials.append(material)
+                    logs.append(f"已接入评论文件: {fname}(共 {len(_comments)} 条, "
+                                f"已去标识化, 不保留昵称/账号/IP 等个人信息)")
+                    continue
             material, log_line = _ingest_upload(fname)
             if material:
                 initial_materials.append(material)
@@ -305,6 +338,16 @@ def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | Non
         for line in logs:
             st.markdown(f"📎 {line}")
 
+        # 「漫研」: 粘贴评论也生成"评论数据素材"条目(与 CSV 路径一致——让模型能从素材区
+        # 感知评论存在, 从而按任务指令触发 sentiment_analyzer); CSV 已生成时不重复。
+        if comments and not any(str(m).startswith("【素材-评论数据】") for m in initial_materials):
+            from core.comment_ingest import _build_material  # noqa: E402
+
+            _paste_material, _ = _build_material(
+                comments, "用户粘贴的评论文本", {"dropped_privacy": 0})
+            initial_materials.append(_paste_material)
+            st.markdown(f"📎 已生成评论数据素材({len(comments)} 条, 已去标识化, 仅文本用于分析)")
+
     initial_state = None
     if resume_thread_id is None:
         initial_state = {
@@ -316,6 +359,9 @@ def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | Non
             "iteration_count": 0,
             "uploaded_files": fnames,
             "steps_log": [],
+            # 「漫研」2026 新增字段(可选, 兼容旧状态):
+            "task_type": _normalize_task_type(task_type),  # 任务类型(未知回退通用调研)
+            "comments": comments,                          # 已去标识化评论文本(仅文本)
         }
 
     # =====================================================================
@@ -469,6 +515,18 @@ def _render_graph_run(user_query: str, fnames: list, resume_thread_id: str | Non
         except Exception:  # noqa: BLE001 —— 读数失败不影响结果展示
             pass
 
+    # ---- 报告引用护栏(防编造链接, v1.7.0-fix4): 若报告含素材中不存在的 URL / 越界引用编号,
+    # 自动用同一批素材重生成报告一次(不重新搜索, 单次成本 = 一次报告 LLM 调用) ----
+    if final_report and final_materials and llm is not None:
+        try:
+            final_report, _retried, _guard_check = rerun_report_with_guard(
+                final_report, final_materials, user_query, llm,
+                task_type=task_type, max_retries=1)
+            if _retried:
+                _logger.warning("引用护栏触发自动重生成报告(1 次): %s", _guard_check)
+        except Exception as _exc5:  # noqa: BLE001 —— 护栏失败不影响结果展示
+            _logger.warning("报告引用护栏执行失败(不影响结果): %s", _exc5)
+
     return final_report, used_rounds, total_materials, new_images, final_materials
 
 
@@ -496,9 +554,10 @@ def _save_report_to_history(topic: str, report: str) -> None:
 
 
 # ============================ 页面 ============================
-st.title("🔎 本地个人调研分析 Agent")
-st.caption("输入主题 → 自动拆解子任务 → 联网搜索 / 读取上传文档 → 反思迭代 → 输出结构化调研报告。"
-           "所有输出仅来源于搜索返回与上传文件内容, 不联网时不会编造。")
+st.title("📡 漫研 · 内容调研与口碑情报 Agent")
+st.caption("面向动漫 / 漫剧 / 短剧内容从业者的 AI 调研助手：选题调研（做什么）· 口碑监测（做得怎么样）· 对标拆解（别人怎么做）。"
+           "输入主题 → 自动拆解子任务 → 联网搜索 / 评论情感分析 → 反思迭代 → 输出结构化报告。"
+           "所有输出仅来源于搜索返回、上传文件与评论数据，不会编造。")
 
 with st.sidebar:
     st.subheader("⚙️ 运行配置(.env)")
@@ -525,6 +584,19 @@ with st.sidebar:
     # ---- HITL(Human-in-the-loop)状态(v1.6.0, 默认关闭) ----
     if HUMAN_IN_THE_LOOP:
         st.write("✅ 人工确认(HITL): 已启用(反思判定不足时将暂停, 由你决定继续/停止)")
+    # ---- 情感分析服务状态(「漫研」并入模块, 2026 新增) ----
+    try:
+        from sentiment.service import get_sentiment_service  # noqa: E402
+
+        _sent_svc = get_sentiment_service()
+        if _sent_svc is not None and _sent_svc.available():
+            st.write("✅ 情感分析(口碑监测): TextCNN 模型已就绪(本地离线推理)")
+        else:
+            _sent_reason = (_sent_svc.load_error if _sent_svc is not None else "服务初始化失败")
+            st.write("❌ 情感分析(口碑监测): 模型不可用("
+                     + (str(_sent_reason)[:120] if _sent_reason else "未知原因") + ")")
+    except Exception:  # noqa: BLE001 —— 状态展示失败不影响主流程
+        pass
     st.divider()
     st.subheader("🛡️ 安全边界")
     st.write(f"- 工具最多迭代 {MAX_ITERATIONS} 轮, 到达上限自动生成报告")
@@ -533,6 +605,8 @@ with st.sidebar:
     else:
         st.write("- 代码沙盒: 已整体关闭(ALLOW_CODE_EXEC=false), Agent 不执行任何代码")
     st.write("- 报告只基于素材, 严禁编造素材中不存在的事实")
+    st.write("- **评论数据合规(底线): 只保留评论文本, 一律删除昵称/账号/IP 等个人信息; "
+             "不存储不展示账号信息, 报告结论必须可溯源**")
     st.write("- 上传文件与图表保存在: `temp_upload/`")
 
     # ============================ 🗂 Agent 会话(SqliteSaver 断点续研) ============================
@@ -629,17 +703,44 @@ with st.sidebar:
                 st.rerun()
 
 # ---------- 输入区 ----------
-st.subheader("1️⃣ 输入调研主题")
+st.subheader("1️⃣ 选择任务类型")
+_task_options = [
+    ("topic_research", "📖 选题调研 —— 帮创作者判断一个题材/方向值不值得做"),
+    ("reputation_monitoring", "📊 口碑监测 —— 分析一部作品的观众评论与口碑（需上传/粘贴评论）"),
+    ("benchmark_analysis", "🎯 对标拆解 —— 拆解一部对标作品的亮点与槽点"),
+    ("general", "🔎 通用调研 —— 任意主题的联网调研（兜底）"),
+]
+_selected_task = st.radio(
+    "任务类型",
+    options=[t[0] for t in _task_options],
+    format_func=lambda t: dict(_task_options)[t],
+    horizontal=True,
+    key="task_type_selector",
+)
+_task_type = _selected_task if _selected_task != _TASK_GENERAL else None
+
+st.subheader("2️⃣ 输入调研主题")
 user_query = st.text_area(
     "调研主题",
-    placeholder="例如: 2024 年中国新能源汽车销量 TOP10 品牌及主要技术路线对比",
+    placeholder="例如: 调研「都市逆袭」题材漫剧的市场热度与观众讨论",
     height=90,
     label_visibility="collapsed",
 )
 
-st.subheader("2️⃣ 上传素材文件(可选)")
+# ---- 「漫研」评论粘贴(口碑监测常用, 2026 新增) ----
+_pasted_comments = ""
+if _task_type == "reputation_monitoring":
+    st.caption("💬 口碑监测支持直接粘贴评论：每行一条（或使用下方文件上传 CSV）")
+    _pasted_comments = st.text_area(
+        "粘贴评论文本(每行一条)",
+        placeholder="例：\n剧情节奏太慢了，前两集没什么吸引力\n画风真的绝，帧帧都是壁纸\n配音很出戏……",
+        height=120,
+        key="pasted_comments",
+    )
+
+st.subheader("3️⃣ 上传素材文件(可选)")
 uploaded_files = st.file_uploader(
-    "支持 PDF / CSV, 上传后会自动读取为素材",
+    "支持 PDF / CSV；CSV 若识别到评论文本列（如「评论」「内容」），会自动做去标识化接入供情感分析",
     type=["pdf", "csv"],
     accept_multiple_files=True,
     label_visibility="collapsed",
@@ -715,14 +816,26 @@ if start_clicked or hitl_thread:
                     st.error(f"保存上传文件 {up.name} 失败(磁盘/权限问题): {exc}, 该文件将被跳过")
 
         st.markdown("---")
-        st.subheader("3️⃣ 实时执行日志")
+        st.subheader("4️⃣ 实时执行日志")
         status = None
         try:
             with st.status("⏳ 任务执行中……", expanded=True) as status:
+                # ---- 评论数据组装(2026 新增): 粘贴评论(去标识化仅保留文本) ----
+                run_comments: list = []
+                if _pasted_comments and _pasted_comments.strip():
+                    # 解析粘贴文本为评论列表(每行一条; 与 CSV 接入一样只保留评论文本)
+                    run_comments = _parse_comments_text(_pasted_comments)
+                    if run_comments:
+                        st.markdown(f"📎 已接入粘贴评论 {len(run_comments)} 条"
+                                    "(已去标识化, 仅文本用于分析)")
+                    else:
+                        st.warning("粘贴的评论解析后为空(可能是空白/符号), 请检查后重试。")
+
                 # resume_thread_id 非空 = 从该会话 checkpoint 继续执行(断点续研/HITL 恢复)
                 report, used_rounds, material_count, images, final_materials = _render_graph_run(
                     topic, fnames, resume_thread_id=resume_thread_id or None,
-                    hitl_decision=hitl_decision)
+                    hitl_decision=hitl_decision, task_type=_task_type,
+                    comments=run_comments)
                 status.update(label=f"✅ 执行完成(共 {used_rounds} 轮, {material_count} 条素材)", state="complete", expanded=False)
 
             # 成功跑完: 清理 HITL 恢复上下文(防止旧状态干扰下一次新建任务)

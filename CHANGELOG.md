@@ -2,6 +2,157 @@
 
 本项目变更记录。版本号规则: 语义化版本(主.次.修订)。
 
+## [1.7.0-fix4] - 2026-09-27 — 引用护栏(防编造链接) + few-shot 工作示例 + 同类项目调研
+
+**改进②(引用护栏, 防编造链接)**
+- `core/report_verifier.py`: 新增 `extract_urls()` / `_norm_url_for_match()`(归一化匹配,
+  容忍素材 URL 尾部的乱码尾巴) / `_material_url_set()`; `verify_report_citations` 新增
+  `url_citations_total` / `invalid_urls` 字段, `all_valid` 收紧为
+  `has_citations and not invalid and not invalid_urls`; 校验文案提示
+  "素材中不存在的链接→已触发自动重生成";
+- `graph_builder.py`: 新增 `rerun_report_with_guard(report, materials, user_query, llm,
+  task_type=None, max_retries=1) -> (最终报告, 重跑次数, 最后一次校验 dict)` —— 报告含
+  素材中不存在的 URL / 越界引用编号时, 用同一批素材自动重生成报告(最多 1 次, 不重新搜索,
+  单次成本 = 一次报告 LLM 调用); 重试后仍不干净则保留最新一版并如实返回校验结果;
+- `main.py` / `server.py`: 任务完成处接入护栏(Streamlit 与 REST API 双侧)。
+
+**改进①(few-shot 工作示例, 提升工具触发稳定性)**
+- `prompts/tool_system.txt`: 内置"口碑监测(评论已接入)"完整调用序列示例
+  (第 1 步 sentiment_analyzer → 第 2/3 步搜索), 并写明"绝不跳过 sentiment_analyzer";
+  对应 web-research-agent 实证结论: 强制 + 完整工作示例(76%)远优于建议性提示(22%)。
+
+**改进③(README 同类开源项目对比)**
+- README 新增 §12: BettaFish(微舆) / open_deep_research / lit-review-council /
+  deer-flow / dzhng/deep-research / web-research-agent / social-sentiment-analyzer
+  对比表 + 与 BettaFish 的定位差异(垂直行业 × 数据合规, 无爬虫/去标识化) +
+  已吸收借鉴点; 后续章节号顺延(§12~§15)。
+
+**测试与验证**
+- 新增 7 条: extract_urls 基础 / 报告 URL 必须存在于素材(2 条) / 无 URL 报告放行 /
+  tool_system 工作示例契约 / 护栏重跑修复 / 重试仍失败如实保留;
+- 全量 **215 passed / 0 failed / 1 skipped**(fix3 基线 208 条, fix4 净增 7 条);
+- 修复: URL 提取正则误把半角 `?` 当终止符(查询串里的 `?` 合法), 改为只截全角标点。
+
+## [1.7.0-fix3] - 2026-09-27 — 质量升级: URL 清洗 / 时间口径 / 书面化转写 / 数据局限声明 / 素材覆盖均衡
+
+> 依据真实调研报告评审(对标拆解《凡人修仙传》用例: 76 处引用全有效, 但发现
+> "表达整洁度"与"数据时效口径"两个低分项 + 引用集中于素材1)做出的工程改进:
+> ① **URL 清洗**: tools/search_tool.py 新增 clean_url() —— 去掉博查 snippet 拼进链接的
+> 百分号编码尾巴(全角/半角)、尾随标点与括号, 只保留真实 http(s) 链接;
+> ② **时间口径**: 搜索工具提取网页 datePublished/dateLastCrawled, 以"发布时间"字段
+> 进入素材文本, 供报告标注数据时间; report_system.txt 强制要求标注时间口径、
+> 跨年份数据不得让读者误读为同期;
+> ③ **书面化转写**: report_system.txt 禁止原样照搬素材错字/口语/乱码/占位符
+> (如"（没说）"), 转写为通顺书面语但信息不增不减;
+> ④ **数据局限声明**: 报告首节"资料获取情况"强制声明素材来源/搜索失败/数据局限
+> (如"未接入用户评论、口碑部分仅基于公开网络讨论");
+> ⑤ **真实性强化**: report_system.txt 明确"素材没有的数据一律不写、推断必须标(推断)";
+> ⑥ **素材覆盖均衡**: reflection_system.txt 强制盘点各素材使用情况, 未被利用/偏少
+> 利用的素材优先深挖; core/report_verifier.py 新增 unused_materials 覆盖度字段,
+> UI 引用校验行提示"N 条素材未被引用";
+> ⑦ **测试 +7**: URL 清洗 4 条、覆盖度 2 条、提示词契约 2 条(报告/反思);
+> 全量 pytest → **208 passed / 0 failed**。
+
+## [1.7.0-fix2] - 2026-09-26 — 修复: 口碑监测 Agent 不触发情感分析 + 真实端到端验证通过
+
+> 真实端到端(真实 DeepSeek + 真实博查 + 本地 TextCNN)发现: 口碑监测 10 轮迭代
+> 全部调用搜索、**从不调用 sentiment_analyzer**——根因: ①tool_hint 只写"上传了
+> 评论文件(CSV)", 粘贴评论不满足该条件; ②粘贴/JSON 评论只注入 state.comments、
+> 不生成【素材-评论数据】素材条目, 模型无法感知评论存在。
+> 修复:
+> ① `core/tasks.py`: 口碑任务 planner_hint/tool_hint 改为"素材区出现『素材-评论数据』
+> 条目时, 在搜索之前先调用 sentiment_analyzer(无需传参, 评论已由系统注入)"。
+> ② `main.py`: 粘贴评论也生成评论数据素材条目(与 CSV 路径共用 _build_material, 去重)。
+> ③ `server.py`: JSON 接口 comments 同样生成评论数据素材条目。
+> ④ 测试: test_mangyan_graph 新增口碑工具指令断言; test_api 评论任务断言素材数 ≥ 2。
+> ⑤ **真实端到端复测通过**: 11 条素材(10 搜索 + 1 情感分析), 4 条评论正确三分类
+> (正向 1/中性 3/负向 0), 报告完整生成并溯源; 全量 pytest → **201 passed**。
+> ⑥ 环境: .env 的 LLM_MODEL 从无效的 `deepseek-v4-flash` 修正为 `deepseek-flash`
+> (DeepSeek Key 实测可用模型仅 deepseek-flash / deepseek-v4-pro); 博查 Key 实测有效
+> (响应字段为 data.webPages.value)。
+
+## [1.7.0-fix1] - 2026-09-26 — 修复: 口碑监测"粘贴评论"路径功能缺陷 + API 测试补全
+
+> 本轮为 v1.7.0 的功能修复与验证补强(发现于交付前自检):
+> ① **修复粘贴评论 bug**: main.py 把 `ingest_comments_text` 返回的"素材文本(字符串)"
+> 当作评论列表传入 Agent State, `list(str)` 会把每条评论拆成**单字符**——口碑监测的
+> 粘贴评论在 UI 上实际无法用于情感分析。修复: `core/comment_ingest.py` 新增
+> `parse_comments_text(text)` 纯函数(返回评论列表, 与 CSV 路径同一套清洗/抽样/去标识化
+> 逻辑), main.py 改用它, 并删除无用导入。
+> ② **补测试 6 条**: `test_comment_ingest` +1(parse_comments_text 列表语义/分隔符/清洗),
+> `test_api` +5(/api/research 携带 task_type+comments 兼容、未知任务类型回退、
+> /api/sentiment 成功/code=1 降级/全空白 422)。
+> ③ **文档**: .env.example 补 SENTIMENT_MODEL_ROOT 说明, 头部标题同步为「漫研」。
+> ④ **验证**: 端到端脚本确认"粘贴评论 → 评论列表(非字符) → 真实 TextCNN 分类"链路可用;
+> 全量 `python -m pytest tests` → **200 passed**。
+
+## [1.7.0] - 2026-09-26 — 「漫研」内容行业任务版: 选题调研/口碑监测/对标拆解 + 评论情感分析并入 + 数据合规接入
+
+> 本轮目标(在 1.6.0 基础上改造, 不新建项目): 把通用调研 Agent 升级为**面向动漫/漫剧/短剧
+> 内容行业**的调研与口碑情报 Agent(项目代号「漫研」)——
+> ① 新增内容行业**任务注册表**(选题调研 / 口碑监测 / 对标拆解 / 通用兜底), 每任务内置
+> 规划/工具/报告三套指令, 切换任务即切换 Agent 行为;
+> ② **并入电商评论课程项目(text_classification)**的 TextCNN 情感分析, 作为口碑监测的
+> 本地统计工具;
+> ③ 新增**评论数据合规接入层**(安全底线): 只收用户主动提供的评论, 一律去标识化
+> (删昵称/账号/IP 等隐私列, 只保留文本), 无任何爬虫/抓取逻辑。
+> 既有节点逻辑 / 断点续研 / 素材兜底 / 记忆 / API / HITL 均保持行为不变。
+
+### 🟢 新增功能
+
+1. **内容行业任务注册表(核心, 项目定位)**
+   - 新增 `core/tasks.py`: `TASK_TOPIC_RESEARCH`(选题调研) / `TASK_REPUTATION`(口碑监测) /
+     `TASK_BENCHMARK`(对标拆解) / `TASK_GENERAL`(通用调研兜底); 每个任务含
+     `planner_hint / tool_hint / report_hint` 三套指令(如口碑监测: 规划提示可用情感分析、
+     工具提示优先调用 `sentiment_analyzer`、报告提示按"口碑分布/被夸点/被吐槽点"成文);
+     `normalize_task_type` 未知/空回退 general(向后兼容); `TASK_LABELS` 中文标签。
+   - `graph_builder.py`: `make_planner_node / make_tool_node / make_report_node` 增加
+     `task_type` 参数并按注册表拼接任务指令到 system prompt; `build_graph` 透传;
+     `main.py` 任务类型 radio + `server.py` `task_type` 字段。
+
+2. **评论情感分析(并入自电商评论课程项目 text_classification)**
+   - 新增 `sentiment/` 包: `service.py`(SentimentService: 懒加载 + 线程安全 +
+     **优雅降级**——torch/jieba/权重缺失时不抛异常, `classify_batch` 返回 [],
+     `summarize` 返回【工具异常】/【提示】说明文字)、`textcnn_model.py`(TextCNN 自包含,
+     超参内联)、`preprocess.py`(清洗/分词/编码, jieba 缺失降级字符切分);
+   - `summarize` 输出: 三分类分布统计 + 每类至多 3 条抽样 + **模型局限声明**
+     ("电商评论预训练权重, 迁移到内容行业评论后准确率会有偏差……报告中请如实标注");
+   - 模型权重 `checkpoints/textcnn.pt` 与词表 `data/processed/vocab.json` 由
+     `E:\pycharmdocuments\text_classification` 拷贝至 `sentiment/models/`(默认目录,
+     `SENTIMENT_MODEL_ROOT` 可覆盖);
+   - `tools/sentiment_tool.py`: Agent 工具 `sentiment_analyzer(comment_texts)` 只返回
+     字符串素材(与 search_tool 同契约, 不抛异常), 别名 `analyze_comments_summary`;
+     `graph_builder.tool_node` 新增 sentiment_analyzer 分支(从 state.comments 取评论)。
+
+3. **评论数据合规接入层(安全底线)**
+   - 新增 `core/comment_ingest.py`: `deidentify`(按列名模式删昵称/用户名/ID/手机/IP/头像/
+     时间等隐私列)、`detect_text_column`(关键词优先 + **纯数字列排除**, 防止销量/年份列
+     误判为评论)、`extract_comments`、`load_comments`(供入口注入 state.comments)、
+     `ingest_comments_file`(head_only 预览/全文)、`ingest_comments_text`(粘贴按行/竖线拆分);
+   - `state_schema.py` 新增可选字段 `task_type: str` 与 `comments: List[str]`;
+   - `main.py` 口碑监测任务显示评论粘贴框, CSV 优先走 `load_comments` 合规接入并生成素材;
+     `server.py` 新增 `POST /api/sentiment`(输入仅文本, 模型不可用返回 code=1 不抛 500)。
+
+4. **单元测试**
+   - 新增 `tests/test_comment_ingest.py`(9 条: 去标识化/评论列识别/纯数字列排除/CSV 与
+     粘贴文本)、`tests/test_sentiment_service.py`(4 条: 优雅降级/空输入/工具契约)、
+     `tests/test_tasks.py`(4 条: 三任务指令完整性/未知回退)、`tests/test_mangyan_graph.py`
+     (5 条: 任务指令注入/情感工具分支/无评论错误素材/兼容性);
+   - 全量 `python -m pytest tests` → **194 passed**(约 45s)。
+
+5. **依赖与文档**
+   - `requirements.txt` 新增 `jieba>=0.42.0` / `torch>=2.0.0`(注释写明 CPU 装法与缺失
+     降级行为); 版本号升至 1.7.0; README 更新定位/目录树/测试数/简历简介。
+
+### 🟧 兼容性说明
+
+- 全部新增为**可选/默认回退**: 不传 task_type / comments 时, 图与 1.6.0 完全一致
+  (normalize_task_type 回退 general, 无评论时情感工具给出"需要评论数据"说明素材);
+- 情感分析为**本地单机推理**(CPU 版 torch, 约 20MB 权重), 模型不可用时自动降级,
+  不阻塞搜索/PDF/代码执行等既有工具; 权重与词表已加入 `.gitignore`(不入库);
+- 评论数据合规: 只处理"用户主动提供"的评论, 项目内不包含任何爬虫/批量抓取逻辑,
+  此边界写入 `core/comment_ingest.py` 模块文档与 README(安全底线)。
+
 ## [1.6.0] - 2026-09-15 — 长期记忆/RAG + FastAPI 服务化 + 引用校验 + 人工确认(HITL)
 
 > 本轮目标(增量开发): 在不动既有业务逻辑的前提下补齐四大增量 ——

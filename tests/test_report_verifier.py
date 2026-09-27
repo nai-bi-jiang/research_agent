@@ -13,11 +13,27 @@ tests/test_report_verifier.py —— core/report_verifier 离线单元测试(v1.
 from core.report_verifier import (
     citation_check_mark,
     extract_citations,
+    extract_urls,
     verify_report_citations,
 )
 
 
+# ---------------- 素材覆盖度(信息性提示: 未被引用的素材编号) ----------------
+def test_unused_materials_reported():
+    materials = ["素材A", "素材B", "素材C"]
+    result = verify_report_citations("结论1【素材1】。结论2【素材3】。", materials)
+    assert result["unused_materials"] == [2]          # 素材2 未被引用
+    assert result["all_valid"] is True                # 覆盖度不影响有效性
+
+
+def test_all_materials_used_gives_empty_unused():
+    materials = ["素材A", "素材B"]
+    result = verify_report_citations("【素材2】【素材1】", materials)
+    assert result["unused_materials"] == []
+
+
 # =====================================================================
+
 # extract_citations
 # =====================================================================
 def test_extract_supports_multiple_bracket_styles():
@@ -119,3 +135,32 @@ def test_mark_no_citations():
     mark = citation_check_mark(result)
     assert mark.startswith("⚠️")
     assert "未包含任何素材引用" in mark
+
+
+
+# ---------------- URL 溯源(防编造链接, v1.7.0-fix4) ----------------
+def test_extract_urls_basic():
+    assert extract_urls("见 https://a.test/x 与 http://b.test/y?q=1") == [
+        "https://a.test/x", "http://b.test/y?q=1"]
+    assert extract_urls("无链接文本") == []
+    assert extract_urls("") == []
+
+
+def test_report_url_must_exist_in_materials():
+    materials = ["来源: 博查\n链接: https://a.test/op)%EF%BC%9B%E3%80%94%E7%B4%A0%E6%9D%90"]
+    # 报告引用素材 URL 的"清洗后"形式 → 有效(容忍素材 URL 乱码尾巴)
+    r1 = "结论【素材1】（链接： https://a.test/op)"
+    assert verify_report_citations(r1, materials)["invalid_urls"] == []
+    # 报告引用素材中不存在的 URL → 判为疑似编造
+    r2 = "结论【素材1】（链接： https://fake.test/not-exist)"
+    chk = verify_report_citations(r2, materials)
+    assert len(chk["invalid_urls"]) == 1
+    assert chk["all_valid"] is False
+
+
+def test_report_without_url_is_allowed():
+    materials = ["【素材-评论数据】来源: 粘贴评论\n共 2 条评论"]
+    r = "结论【素材1】正向占比高。"
+    chk = verify_report_citations(r, materials)
+    assert chk["invalid_urls"] == []        # 无 URL 不算编造
+    assert chk["all_valid"] is True

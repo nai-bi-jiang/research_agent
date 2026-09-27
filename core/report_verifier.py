@@ -26,6 +26,37 @@ from typing import Dict, List
 # 前缀允许任意括号与文字, 后缀允许 [i] / [i,j] 页码引用。
 _CITATION_RE = re.compile(r"素材\s*(\d+)(?!\d)")
 
+# URL 提取: 截到空白/中文标点/括号/引号为止(报告中 URL 均已清洗, 此处兜底去尾巴)
+# 报告中的 URL 已经过 search_tool.clean_url 清洗, 此处兜底防全角尾巴)
+# 报告中的 URL 已经过 search_tool.clean_url 清洗, 此处兜底防全角尾巴)
+_URL_RE = re.compile(r"https?://[^\s，；。：！？、）】」』》>\"']+")
+_PCT_TAIL_RE = re.compile(r"(?:%[0-9A-Fa-f]{1,3})+$")          # 尾随百分号编码乱码
+_TRAIL_PUNCT_RE = re.compile(r"[)\]},.;:!?…、，。；：！？」』】]+$")  # 尾随标点
+
+
+def extract_urls(text: str) -> list:
+    """提取文本中全部 http(s) URL(出现顺序)。无 URL 返回 []。"""
+    if not text:
+        return []
+    return _URL_RE.findall(str(text))
+
+
+def _norm_url_for_match(url: str) -> str:
+    """URL 匹配归一化: 去掉尾随百分号编码/标点, 小写, 去尾部斜杠(比较用, 不修改展示)。"""
+    s = str(url or "").strip()
+    s = _PCT_TAIL_RE.sub("", s)
+    s = _TRAIL_PUNCT_RE.sub("", s).strip()
+    return s.lower().rstrip("/")
+
+
+def _material_url_set(materials: list) -> set:
+    """收集素材文本中出现的全部 URL(归一化后), 供报告 URL 溯源比对。"""
+    out = set()
+    for m in materials or []:
+        for u in extract_urls(str(m)):
+            out.add(_norm_url_for_match(u))
+    return out
+
 
 def extract_citations(report: str) -> List[int]:
     """提取报告中全部素材引用编号(出现顺序, 不去重)。
@@ -56,13 +87,27 @@ def verify_report_citations(report: str, materials: list) -> Dict[str, object]:
     unique = sorted(set(citations))
     invalid = [n for n in unique if n < 1 or n > len(materials)]
     has_citations = len(citations) > 0
+    # 素材覆盖度(信息性提示, 不阻断): 未被报告引用的素材编号 —— 帮助发现
+    # "某素材被忽略/引用偏少"(如编号靠后的素材常被 LLM 忽略), 供 UI 提示反思。
+    used = set(n for n in unique if 1 <= n <= len(materials))
+    unused = sorted(set(range(1, len(materials) + 1)) - used)
+    # URL 溯源(防编造链接, v1.7.0-fix4): 报告中出现的 URL 必须能在素材中找到
+    # (归一化匹配, 容忍素材 URL 尾部的乱码尾巴)。报告无 URL 不算错(评论类素材本无链接)。
+    report_urls = extract_urls(report)
+    material_urls = _material_url_set(materials)
+    invalid_urls = sorted(
+        {u for u in report_urls
+         if _norm_url_for_match(u) not in material_urls})
     return {
         "total_citations": len(citations),
         "unique_citations": unique,
         "invalid_citations": invalid,
+        "unused_materials": unused,
         "materials_count": len(materials),
         "has_citations": has_citations,
-        "all_valid": has_citations and not invalid,
+        "url_citations_total": len(report_urls),
+        "invalid_urls": invalid_urls,
+        "all_valid": has_citations and not invalid and not invalid_urls,
     }
 
 
@@ -76,6 +121,8 @@ def citation_check_mark(result: Dict[str, object]) -> str:
     total = int(result.get("total_citations") or 0)
     unique = list(result.get("unique_citations") or [])
     invalid = list(result.get("invalid_citations") or [])
+    unused = list(result.get("unused_materials") or [])
+    invalid_urls = list(result.get("invalid_urls") or [])
     n_materials = int(result.get("materials_count") or 0)
     if not result.get("has_citations"):
         return f"⚠️ 引用校验: 报告未包含任何素材引用(共 {n_materials} 条素材, 建议重新生成)"
@@ -83,5 +130,11 @@ def citation_check_mark(result: Dict[str, object]) -> str:
         bad = "/".join(f"素材{n}" for n in invalid)
         return (f"⚠️ 引用校验: {total} 处引用(去重 {len(unique)} 个编号), "
                 f"发现 {len(invalid)} 个无效编号({bad}), 素材共 {n_materials} 条")
-    return (f"✅ 引用校验: {total} 处引用(去重 {len(unique)} 个编号)全部有效, "
+    base = (f"✅ 引用校验: {total} 处引用(去重 {len(unique)} 个编号)全部有效, "
             f"素材共 {n_materials} 条")
+    if invalid_urls:
+        base += (f"；⚠️ 发现 {len(invalid_urls)} 个素材中不存在的链接"
+                 f"(如 {invalid_urls[0][:60]}), 已触发自动重生成")
+    if unused:
+        base += f"；⚠️ {len(unused)} 条素材未被引用(素材{'/'.join(f'{n}' for n in unused[:6])}{'等' if len(unused) > 6 else ''}), 建议反思节点深挖"
+    return base

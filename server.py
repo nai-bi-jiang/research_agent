@@ -31,10 +31,12 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import BaseModel, Field
 
 from core.config import env_flag
+from core.comment_ingest import load_comments, _build_material  # 「漫研」评论合规接入(2026 新增)
 from core.file_store import delete_uploaded_files, save_upload
 from core.ingest import ingest_upload
 from core.report_verifier import verify_report_citations
-from graph_builder import build_graph, build_llm
+from core.tasks import normalize_task_type  # 「漫研」任务类型规范化(2026 新增)
+from graph_builder import build_graph, build_llm, rerun_report_with_guard
 from logging_setup import get_logger
 from tools.search_tool import bocha_web_search
 
@@ -103,7 +105,8 @@ _executor = ThreadPoolExecutor(max_workers=int(os.getenv("API_MAX_WORKERS", DEFA
 
 
 # ============================ 后台任务执行 ============================
-def _run_research_task(task_id: str, query: str, fnames: List[str]) -> None:
+def _run_research_task(task_id: str, query: str, fnames: List[str],
+                       task_type: str | None = None, comments: List[str] | None = None) -> None:
     """后台执行一次完整调研(与 main.py 共用 build_graph 引擎), 回写任务状态。
 
     异常不抛出: 全部失败信息写入任务 error 字段(API 调用方可查询到明确原因)。
@@ -115,13 +118,31 @@ def _run_research_task(task_id: str, query: str, fnames: List[str]) -> None:
     config = None
     try:
         # 1) 上传文件预读为素材(与 main.py 行为一致); 同时收集素材文本供文档分块入库
+        #    「漫研」: CSV 若识别到评论文本列, 优先走合规接入(去标识化)并注入 state.comments。
         initial_materials = []
         uploaded_materials = []   # (fname, material) 供长期记忆 save_document
+        comments = list(comments or [])
         for fname in fnames:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext == ".csv":
+                _comments, _stats = load_comments(fname)
+                if _comments:
+                    comments.extend(_comments)
+                    material, _ = _build_material(
+                        _comments, f"上传评论文件 {os.path.basename(fname)}", _stats)
+                    initial_materials.append(material)
+                    continue
             material, _log_line = ingest_upload(fname)
             if material:
                 initial_materials.append(material)
                 uploaded_materials.append((fname, material))
+
+        # 「漫研」: JSON 接口传入的评论(已去标识化)也生成"评论数据素材"条目,
+        # 让模型感知评论存在并触发 sentiment_analyzer(与 UI 粘贴/CSV 路径一致)。
+        if comments and not any(str(m).startswith("【素材-评论数据】") for m in initial_materials):
+            material, _ = _build_material(comments, "API 调用方提供的评论文本",
+                                          {"dropped_privacy": 0})
+            initial_materials.append(material)
 
         # 2) 长期记忆: 上传文档分块入库(RAG 底座) + 图首检索注入
         memory_store = get_memory_store() if env_flag("MEMORY_ENABLED", True) else None
@@ -136,7 +157,8 @@ def _run_research_task(task_id: str, query: str, fnames: List[str]) -> None:
         llm = build_llm()
         checkpointer = InMemorySaver()
         graph = build_graph(llm, web_search_tool=bocha_web_search,
-                            checkpointer=checkpointer, memory_store=memory_store)
+                            checkpointer=checkpointer, memory_store=memory_store,
+                            task_type=task_type)
         thread_id = uuid.uuid4().hex[:12]
         config = {"configurable": {"thread_id": thread_id}}
         initial_state = {
@@ -148,6 +170,9 @@ def _run_research_task(task_id: str, query: str, fnames: List[str]) -> None:
             "iteration_count": 0,
             "uploaded_files": fnames,
             "steps_log": [],
+            # 「漫研」2026 新增字段(可选, 兼容旧状态):
+            "task_type": normalize_task_type(task_type),
+            "comments": comments,
         }
 
         # 4) 执行图(同步等待, 后台线程内阻塞; 完成/失败都回写状态)
@@ -166,9 +191,13 @@ def _run_research_task(task_id: str, query: str, fnames: List[str]) -> None:
         if not report:
             raise RuntimeError("Agent 未生成报告内容(可能素材为空或 LLM 返回空)")
 
-        # 6) 报告引用一致性校验(防幻觉闭环): 确定性核对引用编号是否真实存在
+        # 6) 报告引用一致性校验(防幻觉闭环) + 引用护栏自动重跑(防编造链接, v1.7.0-fix4):
+        #    报告含素材中不存在的 URL / 越界引用编号时, 用同一批素材自动重生成一次。
         try:
-            citation_check = verify_report_citations(report, materials)
+            report, retried, citation_check = rerun_report_with_guard(
+                report, materials, query, llm, task_type=task_type, max_retries=1)
+            if retried:
+                _logger.warning("API 任务引用护栏自动重生成报告(1 次): %s", citation_check)
         except Exception:  # noqa: BLE001 —— 校验失败不影响任务结果
             citation_check = {"error": "校验失败"}
 
@@ -198,6 +227,19 @@ class ResearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="调研主题")
     max_iterations: Optional[int] = Field(
         default=None, ge=1, le=20, description="工具迭代轮次上限(可选, 默认全局 MAX_ITERATIONS)")
+    # 「漫研」2026 新增字段(可选, 向后兼容):
+    task_type: Optional[str] = Field(
+        default=None, description="任务类型: topic_research / reputation_monitoring / benchmark_analysis / general")
+    comments: Optional[List[str]] = Field(
+        default=None, description="评论文本列表(仅文本; 系统去标识化后用于情感分析)")
+
+
+class SentimentRequest(BaseModel):
+    """评论情感分析请求(JSON)。"""
+    comments: List[str] = Field(..., min_length=1, max_length=20000,
+                                description="评论文本列表(每条约 1~500 字; 仅文本, 不含任何账号信息)")
+    max_sample: Optional[int] = Field(default=None, ge=1, le=20000,
+                                      description="抽样上限(可选, 默认 8000, 成本控制)")
 
 
 class TaskOut(BaseModel):
@@ -215,9 +257,10 @@ class TaskOut(BaseModel):
 
 
 app = FastAPI(
-    title="Research Agent API",
-    description="本地 AI 调研 Agent 的 REST 接口: 提交主题/文件 → 自动规划、搜索、反思迭代 → 返回结构化调研报告。",
-    version="1.6.0",
+    title="漫研 · 内容调研与口碑情报 Agent API",
+    description="内容行业 AI 调研与口碑情报智能体 REST 接口: 选题调研 / 口碑监测 / 对标拆解 "
+                "(含评论情感分析工具, 评论一律去标识化)。",
+    version="1.7.0",
 )
 
 
@@ -225,14 +268,20 @@ app = FastAPI(
 def start_research(req: ResearchRequest):
     """提交文本调研任务(JSON), 立即返回 task_id(后台执行, 轮询查询结果)。"""
     task = _store.create(req.query)
-    _executor.submit(_run_research_task, task["task_id"], req.query, [])
+    _executor.submit(_run_research_task, task["task_id"], req.query, [],
+                     task_type=req.task_type, comments=req.comments)
     return task
 
 
 @app.post("/api/research/with-files", response_model=TaskOut)
 def start_research_with_files(query: str = Form(..., min_length=1, max_length=2000),
+                              task_type: str = Form(default=""),
                               files: List[UploadFile] = File(default=[])):
-    """提交带文件(PDF/CSV)的调研任务(multipart/form-data)。"""
+    """提交带文件(PDF/CSV)的调研任务(multipart/form-data)。
+
+    task_type: 任务类型(topic_research / reputation_monitoring / benchmark_analysis / general)。
+    CSV 文件若识别到评论文本列, 自动去标识化接入(不保留昵称/账号/IP), 供口碑监测情感分析。
+    """
     fnames = []
     for up in files:
         data = up.file.read() if up.file else b""
@@ -243,8 +292,34 @@ def start_research_with_files(query: str = Form(..., min_length=1, max_length=20
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"保存上传文件失败: {up.filename}: {exc}")
     task = _store.create(query)
-    _executor.submit(_run_research_task, task["task_id"], query, fnames)
+    _executor.submit(_run_research_task, task["task_id"], query, fnames,
+                     task_type=task_type or None)
     return task
+
+
+@app.post("/api/sentiment")
+def analyze_sentiment(req: SentimentRequest):
+    """「漫研」评论情感分析接口(并入的情感分析服务): 输入评论文本 → 分布统计 + 抽样。
+
+    安全边界: 只接受评论文本本身, 不接收任何账号/昵称/IP 等个人信息; 输出不含用户身份。
+    模型不可用时返回 code=1 + 明确原因(不抛 500)。
+    """
+    from sentiment.service import get_sentiment_service
+
+    service = get_sentiment_service()
+    if service is None:
+        return {"code": 1, "message": "情感分析服务初始化失败", "data": None}
+    texts = [str(t) for t in (req.comments or []) if str(t or "").strip()]
+    if not texts:
+        raise HTTPException(status_code=422, detail="comments 为空(或全为空白文本)")
+    max_sample = req.max_sample or 8000
+    if len(texts) > max_sample:
+        step = len(texts) / max_sample
+        texts = [texts[int(i * step)] for i in range(max_sample)]
+    material = service.summarize(texts)
+    if material.startswith("【工具异常】"):
+        return {"code": 1, "message": material, "data": None}
+    return {"code": 0, "message": "success", "data": {"summary": material}}
 
 
 @app.get("/api/research/{task_id}", response_model=TaskOut)
@@ -265,7 +340,7 @@ def list_research(limit: int = 20):
 @app.get("/health")
 def health():
     """健康检查(部署探针)。"""
-    return {"status": "ok", "service": "research-agent", "version": "1.6.0"}
+    return {"status": "ok", "service": "research-agent", "version": "1.7.0"}
 
 
 # ============================ 上传落盘(复用 core.file_store) ============================

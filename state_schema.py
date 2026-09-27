@@ -26,6 +26,14 @@ class AgentState(TypedDict, total=False):
     user_query: str
     sub_tasks: List[str]
 
+    # ---------------- 「漫研」内容调研任务字段(2026 新增, 可选字段, 兼容旧状态) ----------------
+    # task_type: 任务类型(topic_research / reputation_monitoring / benchmark_analysis / general),
+    #            由 core.tasks 规范化; 缺失/未知一律回退 general(通用调研), 完全向后兼容。
+    # comments:  已去标识化的评论文本列表(仅文本, 不含昵称/账号/IP 等个人信息),
+    #            供 sentiment_analyzer 工具使用(见 core/comment_ingest 合规接入)。
+    task_type: str
+    comments: List[str]
+
     # 素材只增不减: 用 operator.add 做"累加合并", 每次节点返回的新条目自动追加到末尾
     collected_info: Annotated[List[str], add]
 

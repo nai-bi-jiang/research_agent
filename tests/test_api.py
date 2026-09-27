@@ -175,3 +175,67 @@ def test_upload_too_large_file_returns_413(api_env):
         files=[("files", ("big.pdf", io.BytesIO(big), "application/pdf"))],
     )
     assert resp.status_code == 413
+
+
+# =====================================================================
+# 「漫研」(2026 新增): 任务字段透传 + /api/sentiment
+# =====================================================================
+def test_research_with_task_type_and_comments(api_env):
+    """POST /api/research 携带 task_type + comments(口碑监测) → 任务正常完成(接口兼容)。"""
+    resp = client.post("/api/research", json={
+        "query": "监测《某漫剧》开播口碑",
+        "task_type": "reputation_monitoring",
+        "comments": ["画风很棒", "剧情节奏太慢了"],
+    })
+    assert resp.status_code == 200
+    final = _wait_task(resp.json()["task_id"])
+    assert final["status"] == "done"
+    assert final["report"] and "测试调研报告" in final["report"]
+    # 评论已生成"评论数据素材"(initial_state.collected_info) → 素材数 ≥ 2(评论素材 + 搜索素材)
+    assert final["materials_count"] >= 2
+
+
+def test_research_unknown_task_type_falls_back(api_env):
+    """未知任务类型 → 不报错(规范化回退通用调研), 任务正常完成。"""
+    resp = client.post("/api/research", json={
+        "query": "任意主题", "task_type": "not-a-real-task"})
+    assert resp.status_code == 200
+    final = _wait_task(resp.json()["task_id"])
+    assert final["status"] == "done"
+
+
+def test_sentiment_endpoint_returns_summary(api_env, monkeypatch):
+    """POST /api/sentiment: 模型可用 → code=0 + 分布统计素材。"""
+    class _FakeSent:
+        def summarize(self, texts):
+            return f"【素材-sentiment_analyzer】共分析 {len(texts)} 条评论: 正向 2 条"
+
+    monkeypatch.setattr("sentiment.service.get_sentiment_service", lambda: _FakeSent())
+    resp = client.post("/api/sentiment",
+                       json={"comments": ["画风很棒", "剧情拖沓"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 0
+    assert "共分析 2 条评论" in body["data"]["summary"]
+
+
+def test_sentiment_endpoint_degrades_when_model_unavailable(api_env, monkeypatch):
+    """模型不可用 → code=1 + 明确原因, 不抛 500。"""
+    class _FakeBroken:
+        def summarize(self, texts):
+            return "【工具异常】情感分析模型不可用(测试): 缺少权重"
+
+    monkeypatch.setattr("sentiment.service.get_sentiment_service", lambda: _FakeBroken())
+    resp = client.post("/api/sentiment", json={"comments": ["一条评论"]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["code"] == 1
+    assert "情感分析" in body["message"]
+
+
+def test_sentiment_endpoint_blank_comments_returns_422(api_env, monkeypatch):
+    """全空白评论 → 422(不入模型, 避免无意义推理)。"""
+    monkeypatch.setattr("sentiment.service.get_sentiment_service",
+                        lambda: type("S", (), {"summarize": lambda self, t: ""})())
+    resp = client.post("/api/sentiment", json={"comments": ["  ", "\n"]})
+    assert resp.status_code == 422

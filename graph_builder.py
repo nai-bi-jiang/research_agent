@@ -56,11 +56,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import interrupt
 
 from core.config import env_flag, env_float, env_int  # 统一环境变量解析(2026 重构 P1)
+from core.tasks import get_task  # 「漫研」内容行业任务注册表(2026 新增)
 from logging_setup import get_logger
 from state_schema import AgentState
 from tools.code_exec_tool import exec_python_code
 from tools.pdf_reader import read_pdf
 from tools.search_tool import bocha_web_search
+from tools.sentiment_tool import sentiment_analyzer  # 并入的情感分析工具(2026 新增)
 
 _logger = get_logger("graph_builder")
 
@@ -495,9 +497,16 @@ def make_memory_retrieve_node(store, run_top_k: int = MEMORY_RUN_TOP_K,
 
 
 # ============================ 节点函数 ============================
-def make_planner_node(llm: ChatOpenAI):
+# 「漫研」任务指令注入(2026 新增): planner/tool/report 三节点的系统提示词
+# 在基础模板( prompts/*.txt )之上, 按 state.task_type 追加 core/tasks.py 中的
+# 任务专用指令(planner_hint / tool_hint / report_hint)。任务类型未知时 get_task
+# 回退通用调研, 行为与旧版完全一致(向后兼容)。
+def make_planner_node(llm: ChatOpenAI, task_type: str | None = None):
     """① 规划节点: 大模型把需求拆成若干"用于搜集信息"的子任务, 不直接回答问题"""
     system_prompt = _load_prompt("planner_system.txt")
+    planner_hint = get_task(task_type).get("planner_hint", "")
+    if planner_hint:
+        system_prompt += "\n\n" + planner_hint
 
     def planner_node(state: AgentState) -> dict:
         user_query = str(state.get("user_query") or "").strip()
@@ -519,12 +528,16 @@ def make_planner_node(llm: ChatOpenAI):
     return planner_node
 
 
-def make_tool_node(llm: ChatOpenAI, web_search_tool=bocha_web_search):
+def make_tool_node(llm: ChatOpenAI, task_type: str | None = None,
+                   web_search_tool=bocha_web_search):
     """② 工具调用节点: LLM 决策本轮调用哪个工具, 执行后把原始素材累加到 collected_info"""
     system_prompt = _load_prompt("tool_system.txt")
     if not ALLOW_CODE_EXEC:  # P1: 管理员通过 .env 关闭沙盒代码执行后, 提示词层面先劝阻模型
         system_prompt += ("\n\n注意: 本次运行环境已由管理员关闭代码执行工具(ALLOW_CODE_EXEC=false), "
-                          "禁止选择 exec_python_code, 请只使用 bocha_web_search / read_pdf。")
+                          "禁止选择 exec_python_code, 请只使用 bocha_web_search / read_pdf / sentiment_analyzer。")
+    tool_hint = get_task(task_type).get("tool_hint", "")
+    if tool_hint:
+        system_prompt += "\n\n" + tool_hint
 
     def tool_node(state: AgentState) -> dict:
         round_no = int(state.get("iteration_count") or 0) + 1          # 本轮是第几轮
@@ -585,8 +598,24 @@ def make_tool_node(llm: ChatOpenAI, web_search_tool=bocha_web_search):
                 logs.append(f"工具调用(第 {round_no} 轮): exec_python_code(数据分析代码)")
                 logs.append(_clip(content, 400))
 
+            elif tool_name in ("sentiment_analyzer", "sentiment"):
+                # 「漫研」口碑监测核心工具(2026 并入): 对已去标识化的评论做情感分类
+                # 与聚合统计。评论数据由调用方在任务开始时经 core/comment_ingest 接入,
+                # 存于 state.comments(仅文本, 无任何账号类信息 —— 合规底线)。
+                comments = state.get("comments") or []
+                if not comments:
+                    raise ValueError(
+                        "sentiment_analyzer 需要评论数据: 当前任务没有评论(state.comments 为空)。"
+                        "请先上传评论文件(CSV)或粘贴评论文本再发起口碑监测任务。")
+                content = sentiment_analyzer(comments)
+                entry = f"【素材-sentiment_analyzer】\n{content}"
+                logs.append(f"工具调用(第 {round_no} 轮): sentiment_analyzer(对 {len(comments)} 条评论做情感分析)")
+                logs.append(_clip(content, 400))
+
             else:
-                raise ValueError(f"未知工具名「{tool_name}」, 可选: bocha_web_search / read_pdf / exec_python_code。")
+                raise ValueError(
+                    f"未知工具名「{tool_name}」, 可选: bocha_web_search / read_pdf / "
+                    "exec_python_code / sentiment_analyzer。")
         except Exception as exc:  # 工具调用失败也要捕获, 异常转成素材文字, 不中断主流程
             entry = f"【素材-工具调用失败】第 {round_no} 轮, 工具 {tool_name} 调用失败: {type(exc).__name__}: {exc}"
             logs.append(entry)
@@ -703,12 +732,15 @@ def make_reflection_node(llm: ChatOpenAI):
     return reflection_node
 
 
-def make_report_node(llm: ChatOpenAI):
+def make_report_node(llm: ChatOpenAI, task_type: str | None = None):
     """
     ④ 报告节点: 仅从已搜集素材提取/归纳/整理/分析, 严禁编造;
        报告提示词强制要求每条结论标注素材编号【素材N】与来源 URL。
     """
     system_prompt = _load_prompt("report_system.txt")
+    report_hint = get_task(task_type).get("report_hint", "")
+    if report_hint:
+        system_prompt += "\n\n" + report_hint
 
     def report_node(state: AgentState) -> dict:
         user_query = str(state.get("user_query") or "")
@@ -733,6 +765,34 @@ def make_report_node(llm: ChatOpenAI):
         }
 
     return report_node
+
+
+def rerun_report_with_guard(report: str, materials: list, user_query: str,
+                            llm: ChatOpenAI, task_type: str | None = None,
+                            max_retries: int = 1):
+    """报告引用护栏(防编造链接, v1.7.0-fix4): 校验报告引用, 若发现
+    "素材中不存在的 URL"(疑似编造链接)或越界引用编号, 用同一批素材自动重新生成报告,
+    最多重试 max_retries 次; 重试后仍不干净则保留最新一版并如实返回校验结果。
+
+    返回 (最终报告, 重跑次数, 最后一次校验结果 dict)。
+    只重跑报告节点(不重新搜索/不重新反思), 单次成本 = 一次报告生成 LLM 调用。
+    """
+    from core.report_verifier import verify_report_citations
+
+    final = str(report or "").strip()
+    check = verify_report_citations(final, materials)
+    retried = 0
+    while retried < max_retries and (check.get("invalid_urls") or check.get("invalid_citations")):
+        retried += 1
+        try:
+            node = make_report_node(llm, task_type)
+            out = node({"user_query": user_query, "collected_info": materials})
+            final = str(out.get("final_report") or "").strip()
+        except Exception as exc:  # noqa: BLE001 —— 重生成失败保留上一版, 不无限消耗额度
+            _logger.warning("引用护栏自动重生成报告失败(第 %s 次): %s", retried, exc)
+            break
+        check = verify_report_citations(final, materials)
+    return final, retried, check
 
 
 # ============================ HITL 人工确认节点(可选, v1.6.0) ============================
@@ -805,7 +865,7 @@ def route_after_reflection(state: AgentState) -> str:
 def build_graph(llm: ChatOpenAI, web_search_tool=bocha_web_search, checkpointer=None,
                 memory_store=None, memory_run_top_k: int = MEMORY_RUN_TOP_K,
                 memory_doc_top_k: int = MEMORY_DOC_TOP_K,
-                human_in_the_loop: bool = False):
+                human_in_the_loop: bool = False, task_type: str | None = None):
     """
     组装并编译 LangGraph: [memory_retrieve →] planner → tool ⇄ [confirmation ⇄] reflection → report
 
@@ -813,6 +873,9 @@ def build_graph(llm: ChatOpenAI, web_search_tool=bocha_web_search, checkpointer=
     :param web_search_tool: 联网搜索可调用对象(query 为唯一位置参数, 返回素材文本);
                             默认使用 tools.search_tool.bocha_web_search(博查 API),
                             测试时可注入假搜索便于离线验证
+    :param task_type:      「漫研」内容行业任务类型(topic_research / reputation_monitoring /
+                           benchmark_analysis / general)。传入后, planner/tool/report 三节点
+                           按 core/tasks.py 注入任务专用指令; None/未知 = 通用调研(向后兼容)。
     :param checkpointer:   可选的 LangGraph checkpointer, 传入后编译为可断点/持久化恢复的图:
                            - 不传(默认 None): 纯内存运行, 无断点语义 —— 与本函数历史行为
                              完全一致(旧调用方零影响);
@@ -841,10 +904,11 @@ def build_graph(llm: ChatOpenAI, web_search_tool=bocha_web_search, checkpointer=
     """
     graph = StateGraph(AgentState)
 
-    graph.add_node("planner_node", make_planner_node(llm))
-    graph.add_node("tool_node", make_tool_node(llm, web_search_tool=web_search_tool))
+    graph.add_node("planner_node", make_planner_node(llm, task_type=task_type))
+    graph.add_node("tool_node", make_tool_node(llm, task_type=task_type,
+                                               web_search_tool=web_search_tool))
     graph.add_node("reflection_node", make_reflection_node(llm))
-    graph.add_node("report_node", make_report_node(llm))
+    graph.add_node("report_node", make_report_node(llm, task_type=task_type))
     if human_in_the_loop:
         graph.add_node("confirmation_node", make_confirmation_node())
 

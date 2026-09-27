@@ -57,6 +57,45 @@ def test_placeholder_key_returns_tool_error(monkeypatch):
     assert "未配置 BOCHA_API_KEY" in result
 
 
+# ---------------- URL 清洗(表达整洁度: 去掉乱码尾巴) ----------------
+def test_clean_url_removes_percent_encoding_tail():
+    assert st.clean_url("https://a.test/op)%EF%BC%9B%E3%80%94%E7%B4%A0%E6%9D%90") == "https://a.test/op"
+    assert st.clean_url("https://b.test/page)％Ｅ３０％８２") == "https://b.test/page"
+
+
+def test_clean_url_removes_trailing_punctuation():
+    assert st.clean_url("https://a.test/article).") == "https://a.test/article"
+    assert st.clean_url("https://a.test/x，") == "https://a.test/x"
+
+
+def test_clean_url_keeps_normal_url_and_rejects_junk():
+    assert st.clean_url("https://a.test/ok?q=1&x=2") == "https://a.test/ok?q=1&x=2"
+    assert st.clean_url("  https://a.test  ") == "https://a.test"
+    assert st.clean_url("javascript:alert(1)") == ""          # 非 http(s) 一律丢弃
+    assert st.clean_url("www.no-scheme.com") == ""            # 无协议丢弃
+    assert st.clean_url("(无链接)") == ""
+
+
+def test_format_results_includes_published_time(monkeypatch):
+    """发布时间进入素材 + URL 乱码尾巴被清洗(时间口径与表达整洁度)。"""
+    monkeypatch.setenv("BOCHA_API_KEY", "test-key-123")
+
+    def fake(url, json=None, headers=None, timeout=None):
+        return types.SimpleNamespace(status_code=200, json=lambda: {
+            "code": 200,
+            "data": {"webPages": {"value": [
+                {"name": "标题T", "url": "https://t.test/op)%E3%80%82",
+                 "summary": "摘要T", "datePublished": "2026-09-01"},
+            ]}},
+        })
+
+    monkeypatch.setattr(requests, "post", fake)
+    text = st.bocha_web_search("测试", max_results=1)
+    assert "https://t.test/op" in text            # 乱码尾巴已被清洗
+    assert "发布时间: 2026-09-01" in text          # 时间口径进入素材
+    assert "摘要: 摘要T" in text
+
+
 # ---------------- 请求层异常 ----------------
 def test_network_error_returns_tool_error(monkeypatch):
     _patch_env_key(monkeypatch)
