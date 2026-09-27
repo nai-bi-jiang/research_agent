@@ -680,7 +680,7 @@ BettaFish 用爬虫采集全网平台数据(微博/抖音/小红书等), 覆盖�
 ## 13. 开源 License
 
 
-本项目采用 [MIT License](LICENSE)(Copyright (c) 2026 nbjrhmt, 2026 P4 起正式开源):
+本项目采用 [MIT License](LICENSE)(Copyright (c) 2026 乃比江, 2026 P4 起正式开源):
 可自由使用、修改、分发(含商用), 需保留版权声明; Fork 修改后对外发布时建议保留原作者署名。
 如需更换为 Apache-2.0 等其他许可证, 直接替换 LICENSE 文件并同步本段说明即可。
 

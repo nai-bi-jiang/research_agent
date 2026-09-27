@@ -21,7 +21,7 @@ description = "漫研 · 内容调研与口碑情报 Agent(LangGraph + Streamlit
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "nbjrhmt" }]
+authors = [{ name = "乃比江" }]
 keywords = [
     "langgraph", "llm-agent", "streamlit", "research-agent",
     "reflexion", "tool-calling", "sandbox", "openai-compatible",
