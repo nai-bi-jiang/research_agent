@@ -107,6 +107,32 @@ def test_save_run_and_search_chinese(store):
     assert hits[0]["score"] is not None
 
 
+def test_save_run_writes_theme_vector_and_get_run_record(store):
+    """v1.7.1: save_run 同时写入 run_query 主题短向量; 命中后按 run_id 取回完整记录。"""
+    rid = store.save_run("主题甲", ["素材X"], "报告Y")
+    q_hits = store.search("主题甲", top_k=1, kind="run_query")
+    assert q_hits, "主题短向量应可检索命中"
+    assert q_hits[0]["kind"] == "run_query"
+    assert q_hits[0]["run_id"] == rid
+
+    rec = store.get_run_record(rid)
+    assert rec is not None
+    assert rec["kind"] == "run"
+    assert rec["query"] == "主题甲"
+    assert "素材X" in rec["content"] and "报告Y" in rec["content"]
+    assert store.get_run_record("不存在的id") is None
+
+
+def test_run_query_theme_distance_separable(store):
+    """主题向量距离可分性(阈值校准依据): 同主题旁支明显近于无关主题。"""
+    store.save_run("《铃芽之旅》导演是谁", ["素材"], "报告")
+    store.save_run("拆解《凡人修仙传》系列能长期热播的原因", ["素材"], "报告")
+    hits = store.search("《铃芽之旅》导演是谁？一句话回答", top_k=2, kind="run_query")
+    assert hits
+    # 最相似命中必须是同主题记录, 而非无关的《凡人修仙传》
+    assert hits[0]["query"] == "《铃芽之旅》导演是谁"
+
+
 def test_save_document_chunks_and_search(store):
     """文档分块 RAG: 全文分块入库后, 按主题检索命中相关块, 且块数 = 实际入库数。"""
     text = ("锂离子电池技术原理。\n" * 30) + "固态电池是下一代电池技术方向。\n" * 30

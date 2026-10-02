@@ -452,15 +452,24 @@ def _clean_keywords(value: Any, max_items: int = 8, max_len: int = 200) -> List[
 # ============================ 记忆检索节点(可选, v1.6.0 长期记忆/RAG) ============================
 MEMORY_RUN_TOP_K = 3      # 历史任务记忆检索条数
 MEMORY_DOC_TOP_K = 3      # 上传文档片段检索条数
+# 余弦距离阈值(chroma cosine 空间, 越小越相似)。主题向量(query-vs-query)距离可分:
+# 同主题旁支问题实测 ~0.06, 无关但同题材 ~0.30, 明显无关 >0.53 → run 阈值取 0.2;
+# 文档块是长文本 vs 短查询, 距离天然偏高且无法细分区 → 只过滤明显无关(>0.55), 见 CHANGELOG。
+MEMORY_RUN_SCORE_THRESHOLD = 0.2
+MEMORY_DOC_SCORE_THRESHOLD = 0.55
 
 
 def make_memory_retrieve_node(store, run_top_k: int = MEMORY_RUN_TOP_K,
-                              doc_top_k: int = MEMORY_DOC_TOP_K):
+                              doc_top_k: int = MEMORY_DOC_TOP_K,
+                              run_score_threshold: float = MEMORY_RUN_SCORE_THRESHOLD,
+                              doc_score_threshold: float = MEMORY_DOC_SCORE_THRESHOLD):
     """
     ①' 记忆检索节点(可选, 位于 planner 之前): 任务开始时检索相似历史素材并注入。
 
     两类检索(见 memory/vector_memory.py):
-        - kind=run      跨任务长期记忆: 检索相似历史调研, 复用已搜集素材, 减少重复搜索;
+        - kind=run_query 跨任务长期记忆(v1.7.1): 先按"任务主题短向量"匹配相似历史调研
+                        (query-vs-query 距离可分), 阈值过滤不相关主题, 再按 run_id
+                        取回完整记录注入, 复用已搜集素材, 减少重复搜索;
         - kind=doc_chunk 上传文档分块(RAG): 检索与 user_query 最相关的文档片段,
                         大文件不再只靠全文预览(全文可能被 token 预算截断)。
     注入素材带【历史记忆】/【文档片段】前缀, 与其他素材一样参与反思判断与报告
@@ -470,25 +479,48 @@ def make_memory_retrieve_node(store, run_top_k: int = MEMORY_RUN_TOP_K,
         user_query = str(state.get("user_query") or "").strip()
         logs: List[str] = []
         entries: List[str] = []
-        run_hits, doc_hits = [], []
+        n_run_injected, n_run_skipped = 0, 0
+        n_doc_injected, n_doc_skipped = 0, 0
         try:
-            run_hits = store.search(user_query, top_k=run_top_k, kind="run") or []
-            for hit in run_hits:
-                content = str(hit.get("content") or "")
+            # 一阶段: 主题短向量匹配 + 阈值过滤(不相关主题不注入, 防历史素材噪音)
+            run_q_hits = store.search(user_query, top_k=run_top_k,
+                                      kind="run_query") or []
+            for hit in run_q_hits:
+                score = hit.get("score")
+                if score is not None and score > run_score_threshold:
+                    n_run_skipped += 1
+                    continue
+                # 二阶段: 按 run_id 取回完整记录; 取回失败则降级用命中条目自带内容
+                rec = None
+                run_id = hit.get("run_id")
+                if run_id:
+                    try:
+                        rec = store.get_run_record(run_id)
+                    except Exception:  # noqa: BLE001 —— 降级, 见下
+                        rec = None
+                if not rec:
+                    rec = {"content": hit.get("content") or "", "query": hit.get("query")}
+                content = str(rec.get("content") or "")
                 if content.strip():
-                    src = str(hit.get("query") or "历史调研").strip()
+                    src = str(rec.get("query") or hit.get("query") or "历史调研").strip()
                     entries.append(f"【历史记忆】相关历史调研: {src}\n{content[:1500]}")
+                    n_run_injected += 1
             doc_hits = store.search(user_query, top_k=doc_top_k, kind="doc_chunk") or []
             for hit in doc_hits:
+                score = hit.get("score")
+                if score is not None and score > doc_score_threshold:
+                    n_doc_skipped += 1
+                    continue
                 content = str(hit.get("content") or "")
                 if content.strip():
                     src = str(hit.get("source_name") or "上传文档").strip()
                     entries.append(f"【文档片段】来源: {src}\n{content[:1500]}")
+                    n_doc_injected += 1
         except Exception as exc:  # noqa: BLE001 —— 记忆检索失败不阻断主流程
             logs.append(f"记忆检索失败(不影响任务执行): {type(exc).__name__}: {exc}")
         if entries:
-            logs.append(f"记忆检索: 命中历史记忆 {len(run_hits)} 条 / 文档片段 {len(doc_hits)} 条, "
-                        f"已注入素材(带来源标注)")
+            logs.append(f"记忆检索: 注入历史记忆 {n_run_injected} 条(过滤 {n_run_skipped}) / "
+                        f"文档片段 {n_doc_injected} 条(过滤 {n_doc_skipped}), 均带来源标注")
         else:
             logs.append("记忆检索: 未命中相似历史素材或文档片段")
         return {"collected_info": entries, "steps_log": logs}

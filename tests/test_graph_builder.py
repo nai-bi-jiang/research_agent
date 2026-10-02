@@ -493,38 +493,80 @@ def test_tool_node_round_logs_contain_material_count():
 # v1.6.0: 长期记忆/RAG 记忆检索节点(make_memory_retrieve_node / build_graph 接线)
 # =====================================================================
 class _FakeMemoryStore:
-    """内存版假记忆库: 按 kind 返回固定检索结果, 用于验证节点注入与图接线。"""
+    """内存版假记忆库: 按 kind 返回固定检索结果, 用于验证节点注入与图接线。
 
-    def __init__(self, run_hits=None, doc_hits=None):
-        self.run_hits = run_hits or []
+    与真实 MemoryStore(v1.7.1)契约一致: 检索主题走 kind=run_query(带 score),
+    命中后按 run_id 经 get_run_record 取回完整记录。
+    """
+
+    def __init__(self, run_query_hits=None, doc_hits=None):
+        self.run_query_hits = run_query_hits or []
         self.doc_hits = doc_hits or []
         self.seen_kinds = []
+        self.records = {}  # run_id -> 完整记录 dict
 
     def search(self, query, top_k=3, kind=None):
         self.seen_kinds.append(kind)
-        if kind == "run":
-            return list(self.run_hits)
+        if kind == "run_query":
+            return list(self.run_query_hits)
         if kind == "doc_chunk":
             return list(self.doc_hits)
-        return list(self.run_hits) + list(self.doc_hits)
+        return []
+
+    def get_run_record(self, run_id):
+        return self.records.get(run_id)
 
 
 def test_memory_retrieve_node_injects_history_and_doc_chunks():
     """记忆检索节点: 历史记忆与文档片段分别注入 collected_info, 且日志说明命中。"""
     store = _FakeMemoryStore(
-        run_hits=[{"content": "历史素材A", "query": "相似主题1"}],
-        doc_hits=[{"content": "文档块B", "source_name": "白皮书.pdf"}],
+        run_query_hits=[{"query": "相似主题1", "run_id": "r1", "score": 0.05}],
+        doc_hits=[{"content": "文档块B", "source_name": "白皮书.pdf", "score": 0.1}],
     )
+    store.records["r1"] = {"content": "历史素材A", "query": "相似主题1"}
     node = gb.make_memory_retrieve_node(store, run_top_k=3, doc_top_k=3)
     out = node({"user_query": "调研主题", "collected_info": []})
 
     entries = out.get("collected_info") or []
     assert len(entries) == 2
-    assert "【历史记忆】" in entries[0] and "相似主题1" in entries[0]
+    assert "【历史记忆】" in entries[0] and "历史素材A" in entries[0]
     assert "【文档片段】" in entries[1] and "白皮书.pdf" in entries[1]
     logs = "\n".join(out.get("steps_log") or [])
-    assert "命中历史记忆 1 条" in logs and "文档片段 1 条" in logs
-    assert store.seen_kinds == ["run", "doc_chunk"]
+    assert "注入历史记忆 1 条" in logs and "文档片段 1 条" in logs
+    assert store.seen_kinds == ["run_query", "doc_chunk"]
+
+
+def test_memory_retrieve_node_filters_low_similarity_hits():
+    """阈值过滤: 主题距离超阈值(不相关)的历史记忆与文档块均不注入, 日志记录过滤数。"""
+    store = _FakeMemoryStore(
+        run_query_hits=[
+            {"query": "无关主题X", "run_id": "r9", "score": 0.4},   # > 0.2, 应过滤
+            {"query": "相似主题1", "run_id": "r1", "score": 0.05},  # 保留
+        ],
+        doc_hits=[{"content": "无关文档块", "source_name": "无关.pdf", "score": 0.9}],  # > 0.55, 应过滤
+    )
+    store.records["r1"] = {"content": "历史素材A", "query": "相似主题1"}
+    store.records["r9"] = {"content": "无关素材", "query": "无关主题X"}
+    node = gb.make_memory_retrieve_node(store)
+    out = node({"user_query": "调研主题", "collected_info": []})
+
+    entries = out.get("collected_info") or []
+    assert len(entries) == 1
+    assert "历史素材A" in entries[0] and "无关素材" not in entries[0]
+    logs = "\n".join(out.get("steps_log") or [])
+    assert "过滤 1" in logs  # run 过滤 1 条(文档块也过滤 1 条, 见日志完整文本)
+
+
+def test_memory_retrieve_node_get_record_fallback_to_hit_content():
+    """get_run_record 缺失/失败时: 降级使用命中条目自带内容, 不抛异常。"""
+    store = _FakeMemoryStore(
+        run_query_hits=[{"query": "主题", "run_id": "missing", "content": "自带内容C",
+                         "score": 0.01}],
+    )
+    node = gb.make_memory_retrieve_node(store)
+    out = node({"user_query": "调研主题", "collected_info": []})
+    entries = out.get("collected_info") or []
+    assert len(entries) == 1 and "自带内容C" in entries[0]
 
 
 def test_memory_retrieve_node_no_hits_returns_empty_materials():

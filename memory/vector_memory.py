@@ -41,7 +41,8 @@ COLLECTION_NAME = "research_memory"
 DEFAULT_CHUNK_SIZE = 800        # 单块字符数(中文约 1 字符/token, 对应约 800 token)
 DEFAULT_CHUNK_OVERLAP = 100     # 块间重叠字符数(保留上下文衔接)
 MAX_DOC_LEN = 30000             # 单条向量化文本上限(防超长记录)
-KIND_RUN = "run"                # 任务级记忆
+KIND_RUN = "run"                # 任务级记忆(完整记录, 供取回注入)
+KIND_RUN_QUERY = "run_query"    # 任务主题短向量(仅主题文本, 供相似度匹配)
 KIND_DOC_CHUNK = "doc_chunk"    # 上传文档分块
 
 
@@ -110,6 +111,45 @@ class MemoryStore:
         self._collection = self._client.get_or_create_collection(
             name=collection_name, **kwargs)
         self._lock = threading.Lock()
+        try:
+            self._backfill_run_queries()  # 老数据补写主题向量(幂等, 失败不影响使用)
+        except Exception as exc:  # noqa: BLE001 —— 回填失败只记日志, 不阻断
+            _logger.warning("记忆库主题向量回填失败(不影响使用): %s: %s",
+                            type(exc).__name__, exc)
+
+    # ---------------- 老数据回填 ----------------
+    def _backfill_run_queries(self) -> None:
+        """为旧版本保存的 kind=run 记录补写配套 run_query 主题向量(启动时幂等执行)。
+
+        v1.7.1 之前只有 kind=run 完整记录(长文档), 与短查询的余弦距离天然偏高且
+        无法区分相关/无关主题; 补写后检索走 kind=run_query 短向量 + 阈值过滤。
+        """
+        try:
+            res = self._collection.get(where={"kind": KIND_RUN})
+        except Exception:  # noqa: BLE001 —— 旧版 chromadb 或空库, 直接跳过
+            return
+        if not res or not (res.get("ids") or []):
+            return
+        metas = res.get("metadatas") or []
+        for i, doc_id in enumerate(res["ids"]):
+            query = (metas[i] or {}).get("query") if i < len(metas) else None
+            if not query:
+                continue
+            existing = self._collection.get(
+                where={"$and": [{"kind": KIND_RUN_QUERY}, {"query": str(query)}]},
+                limit=1)
+            if existing and (existing.get("ids") or []):
+                continue  # 已有配套主题向量, 幂等跳过
+            self._collection.upsert(
+                ids=[f"{doc_id}_q"],
+                documents=[str(query)[:500]],
+                metadatas=[{
+                    "kind": KIND_RUN_QUERY,
+                    "query": str(query)[:500],
+                    "run_id": doc_id,
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }],
+            )
 
     # ---------------- 写入 ----------------
     def save_run(self, query: str, materials: list, report: str) -> str:
@@ -120,6 +160,7 @@ class MemoryStore:
         doc_body = "\n\n".join(str(m)[:2000] for m in (materials or []))
         doc = (f"【调研主题】{query}\n【素材要点】\n{doc_body}\n【最终报告】\n{report[:8000]}")
         doc_id = uuid.uuid4().hex
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
         with self._lock:
             self._collection.upsert(
                 ids=[doc_id],
@@ -127,10 +168,43 @@ class MemoryStore:
                 metadatas=[{
                     "kind": KIND_RUN,
                     "query": str(query)[:500],
-                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "time": now,
+                }],
+            )
+            # 配套主题短向量: 检索按 query-vs-query 匹配(距离可分), 命中后按 run_id 取回完整记录
+            self._collection.upsert(
+                ids=[f"{doc_id}_q"],
+                documents=[str(query)[:500]],
+                metadatas=[{
+                    "kind": KIND_RUN_QUERY,
+                    "query": str(query)[:500],
+                    "run_id": doc_id,
+                    "time": now,
                 }],
             )
         return doc_id
+
+    def get_run_record(self, run_id: str) -> Optional[dict]:
+        """按 run_id 取回任务级记忆完整记录(供检索命中后注入素材)。
+
+        :return: {"id", "content", "kind", "query"} 或 None(不存在/取回失败)
+        """
+        if not run_id:
+            return None
+        try:
+            res = self._collection.get(ids=[str(run_id)])
+        except Exception:  # noqa: BLE001 —— 取回失败视同无记录
+            return None
+        if not res or not (res.get("ids") or []):
+            return None
+        metas = res.get("metadatas") or [[]]
+        meta = metas[0] if metas else {}
+        return {
+            "id": res["ids"][0],
+            "content": (res.get("documents") or [""])[0],
+            "kind": (meta or {}).get("kind"),
+            "query": (meta or {}).get("query"),
+        }
 
     def save_document(self, source_name: str, text: str,
                       chunk_size: int = DEFAULT_CHUNK_SIZE,
@@ -194,6 +268,8 @@ class MemoryStore:
                 item["query"] = meta.get("query")
             if (meta or {}).get("source_name"):
                 item["source_name"] = meta.get("source_name")
+            if (meta or {}).get("run_id"):
+                item["run_id"] = meta.get("run_id")
             items.append(item)
         return items
 

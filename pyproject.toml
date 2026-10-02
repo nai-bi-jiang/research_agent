@@ -16,7 +16,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "research-agent"
-version = "1.7.0"
+version = "1.7.1"
 description = "漫研 · 内容调研与口碑情报 Agent(LangGraph + Streamlit): 选题调研/口碑监测/对标拆解三类内容任务, 规划→联网搜索/PDF/受限代码执行/评论情感分析→反思→溯源报告"
 readme = "README.md"
 requires-python = ">=3.10"
